@@ -77,5 +77,31 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 规则变更影响评估（对照样本）
+
+质检规则上线前，用同批字段样本对旧版/新版规则做对照评估，覆盖
+`data_quality_rule` 与 `data_transform` 两个模块（链路11）：
+
+- `quality_sample`：字段样本。同一来源行（批次+来源+行键+字段）只保留一个
+  生效样本；并发补录去重，迟到更正生成新版本，旧版本保留可回查。
+- `quality_impact_report`：影响报告，关联实际规则（ID+编号+版本+配置快照）
+  与样本批次；同批样本变化会把已完成的报告打回「评估中」。
+- `quality_impact_detail`：新旧规则逐样本对照明细，即质量影响明细视图
+  背后的对照结果，供数据转换编排跨模块读取。
+- `transform_review_list`：待复核清单。确认受影响的转换范围（新增阻断的
+  来源字段）写入清单，按 待复核 → 已确认 → 已排期 流转，安排下一轮转换。
+
+对应端点（`backend/app/routers/pipeline.py`）：
+
+| 端点 | 说明 |
+| --- | --- |
+| `POST /api/pipeline/quality-sample-register` | 同批样本补录（去重/更正） |
+| `GET /api/pipeline/quality-sample-lineage` | 样本更正链回查 |
+| `POST /api/pipeline/quality-impact-evaluate` | 创建影响报告并执行对照评估 |
+| `GET /api/pipeline/quality-impact-view` | 质量影响明细视图（覆盖样本及版本、按来源字段对账） |
+| `POST /api/pipeline/transform-review-import` | 跨模块读取对照结果写入待复核清单 |
+| `GET /api/pipeline/transform-review-list` | 待复核清单查询 |
+| `POST /api/pipeline/transform-review-action` | 确认范围 / 排期转换 |
+
 领域：数据工程
 子方向：数据采集、爬虫与RPA

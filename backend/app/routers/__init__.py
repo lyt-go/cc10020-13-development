@@ -3,4 +3,6 @@ from __future__ import annotations
 
 from app.routers import resource, pipeline
 
-ROUTERS = [resource, pipeline]
+# pipeline 固定前缀 /api/pipeline 必须先注册，否则其 GET 端点会被
+# 资源路由的 /api/{module}/{entry_id} 动态段抢先匹配（entry_id 解析为 int 报 422）。
+ROUTERS = [pipeline, resource]

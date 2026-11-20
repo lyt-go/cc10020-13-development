@@ -2,7 +2,11 @@
 
 提供从源Schema到目标Schema的字段级映射和值转换能力，
 支持嵌套结构抽取、类型强制转换和异常降级策略。
-跨模块关联：data_quality_rule（质量校验）、data_lake_sink（转换后落湖）。
+跨模块关联：data_quality_rule（质量校验、规则变更影响对照结果）、
+data_lake_sink（转换后落湖）。
+
+待复核清单（transform_review_list）：跨模块读取质量影响明细视图背后的
+对照结果，把得到确认的转换范围写入清单，用于安排下一轮转换。
 """
 from __future__ import annotations
 
@@ -24,6 +28,10 @@ class DataTransformService(BaseModuleService):
     STATUS_ORDER = ["草稿", "待校验", "已生效", "已停用"]
     ACTION_RULES = {"提交校验": "待校验", "标记生效": "已生效", "停用规则": "已停用"}
     NEGATIVE_ACTIONS = ["停用规则"]
+
+    # 待复核清单存储分区与复核状态流转
+    REVIEW_KEY = "transform_review_list"
+    REVIEW_ACTIONS = {"确认范围": "已确认", "排期转换": "已排期", "退回待复核": "待复核"}
 
     _BUILTIN_FUNCTIONS: dict[str, Callable[[Any], Any]] = {
         "to_string": lambda x: str(x) if x is not None else "",
@@ -184,6 +192,106 @@ class DataTransformService(BaseModuleService):
             "results": results,
         }
 
+    # ──────────────────────────────────────────────
+    # 待复核清单：跨模块读取质量影响对照结果
+    # ──────────────────────────────────────────────
+    def import_impact_review_scope(self, report_id: int,
+                                   transform_rule_id: int | None = None,
+                                   round_label: str = "下一轮") -> dict[str, Any]:
+        """把影响报告确认受影响的转换范围写入待复核清单。
+
+        跨模块读取质量影响明细视图背后的对照结果（data_quality_rule），
+        新版规则「新增阻断」的来源字段即为需要复核的转换范围；
+        同一报告同一来源字段在待复核/已确认阶段不重复写入。
+        """
+        from app.services.data_quality_rule import DataQualityRuleService
+        quality_svc = DataQualityRuleService()
+        comparison = quality_svc.impact_comparison_results(report_id)
+        if not comparison.get("ok"):
+            return {"ok": False, "message": comparison.get("message", "影响报告不存在"),
+                    "imported": 0, "items": []}
+
+        report = comparison.get("report") or {}
+        impacted = [r for r in comparison.get("results", [])
+                    if r.get("影响分类") == "新增阻断"]
+        existing = json_store.get_all(self.REVIEW_KEY)
+
+        imported = 0
+        skipped = 0
+        items: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for row in impacted:
+            scope_key = (str(row.get("数据来源")), str(row.get("来源字段")))
+            if scope_key in seen:
+                skipped += 1
+                continue
+            seen.add(scope_key)
+            duplicated = any(
+                e for e in existing
+                if int(e.get("来源报告ID", 0)) == int(report_id)
+                and str(e.get("数据来源")) == scope_key[0]
+                and str(e.get("来源字段")) == scope_key[1]
+                and e.get("复核状态") in ("待复核", "已确认")
+            )
+            if duplicated:
+                skipped += 1
+                continue
+            item = {
+                "清单编号": "",
+                "来源报告ID": int(report_id),
+                "来源报告编号": report.get("报告编号"),
+                "关联转换规则ID": int(transform_rule_id) if transform_rule_id else None,
+                "数据来源": row.get("数据来源"),
+                "来源字段": row.get("来源字段"),
+                "影响分类": row.get("影响分类"),
+                "转换范围": row.get("来源字段"),
+                "复核状态": "待复核",
+                "status": "待复核",
+                "计划轮次": round_label,
+                "pending": True,
+                "abnormal": False,
+            }
+            saved = json_store.insert(self.REVIEW_KEY, item)
+            saved = json_store.update(self.REVIEW_KEY, int(saved["id"]),
+                                      {"清单编号": f"TRL-{int(saved['id']):04d}"})
+            items.append(saved)
+            imported += 1
+
+        return {
+            "ok": True,
+            "report_id": int(report_id),
+            "imported": imported,
+            "skipped": skipped,
+            "items": items,
+            "message": f"已把 {imported} 条确认受影响的转换范围写入待复核清单"
+                       f"（跳过重复 {skipped} 条），计划轮次：{round_label}",
+        }
+
+    def list_review_items(self, status: str | None = None) -> dict[str, Any]:
+        """查询待复核清单，可按复核状态过滤。"""
+        items = json_store.get_all(self.REVIEW_KEY)
+        if status:
+            items = [i for i in items if i.get("复核状态") == status]
+        items.sort(key=lambda i: int(i.get("id", 0)))
+        return {"ok": True, "total": len(items), "items": items}
+
+    def review_action(self, item_id: int, action: str) -> dict[str, Any]:
+        """复核动作：确认范围 → 已确认；排期转换 → 已排期（安排下一轮转换）。"""
+        item = json_store.get_by_id(self.REVIEW_KEY, int(item_id))
+        if item is None:
+            return {"ok": False, "message": f"待复核条目 {item_id} 不存在"}
+        target = self.REVIEW_ACTIONS.get(action)
+        if target is None:
+            return {"ok": False,
+                    "message": f"动作「{action}」不属于待复核清单可执行范围"}
+        saved = json_store.update(self.REVIEW_KEY, int(item_id), {
+            "复核状态": target,
+            "status": target,
+            "pending": target != "已排期",
+        })
+        return {"ok": True, "item": saved,
+                "message": f"待复核条目 {saved.get('清单编号')} 已{action}，状态：{target}"}
+
     def domain_snapshot(self) -> dict[str, Any]:
         """输出数据转换编排的数据质量快照。"""
         rows = json_store.get_all(self.MODULE)
@@ -202,4 +310,8 @@ class DataTransformService(BaseModuleService):
             "abnormal": sum(1 for r in rows if r.get("abnormal")),
             "active_rules": sum(1 for r in rows if r.get("status") == "已生效"),
             "operation": self.OPERATION_TERM,
+            "review_items": len(json_store.get_all(self.REVIEW_KEY)),
+            "review_pending": sum(
+                1 for i in json_store.get_all(self.REVIEW_KEY)
+                if i.get("复核状态") == "待复核"),
         }

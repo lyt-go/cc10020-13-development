@@ -71,15 +71,22 @@ def _seed_and_cleanup():
 
         # Re-import all services to pick up new store
         import importlib
-        for mod in [api_mod, wh_mod, es_mod, mq_mod, dlq_mod, sink_mod, dt_mod,
-                     dq_mod, dr_mod, df_mod, bi_mod, ic_mod, bj_mod, ctl_mod,
-                     rlc_mod, aas_mod, ea_mod, im_mod]:
+        service_mods = [api_mod, wh_mod, es_mod, mq_mod, dlq_mod, sink_mod, dt_mod,
+                        dq_mod, dr_mod, df_mod, bi_mod, ic_mod, bj_mod, ctl_mod,
+                        rlc_mod, aas_mod, ea_mod, im_mod]
+        for mod in service_mods:
             importlib.reload(mod)
+
+        # 测试体直接使用裸名 json_store，指向与服务一致的临时存储
+        globals()["json_store"] = store
 
         yield
 
         import app.persistence
         app.persistence.json_store = global_store
+        # 恢复全局存储后同样重载服务模块，避免后续用例拿到已删除的临时存储
+        for mod in service_mods:
+            importlib.reload(mod)
 
 
 # ──────────────────────────────────────────────────────────

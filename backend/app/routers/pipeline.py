@@ -172,3 +172,94 @@ def pipeline_archive_execute(policy_id: int) -> dict[str, Any]:
     from app.services.event_archive import EventArchiveService
     svc = EventArchiveService()
     return svc.execute_archive(policy_id=policy_id)
+
+
+class QualitySampleRegisterRequest(BaseModel):
+    samples: list[dict[str, Any]] = []
+
+
+class ImpactEvaluateRequest(BaseModel):
+    old_rule_id: int
+    new_rule_id: int
+    sample_batch: str
+
+
+class ReviewImportRequest(BaseModel):
+    report_id: int
+    transform_rule_id: int | None = None
+    round_label: str = "下一轮"
+
+
+class ReviewActionRequest(BaseModel):
+    item_id: int
+    action: str
+
+
+@router.post("/quality-sample-register")
+def pipeline_quality_sample_register(request: QualitySampleRegisterRequest) -> dict[str, Any]:
+    """链路11-1: 同批字段样本补录（并发补录同一来源行只取一个生效样本）。"""
+    from app.services.data_quality_rule import DataQualityRuleService
+    svc = DataQualityRuleService()
+    return svc.register_samples(request.samples)
+
+
+@router.get("/quality-sample-lineage")
+def pipeline_quality_sample_lineage(sample_id: int) -> dict[str, Any]:
+    """链路11-2: 样本更正链回查。"""
+    from app.services.data_quality_rule import DataQualityRuleService
+    svc = DataQualityRuleService()
+    return svc.sample_lineage(sample_id)
+
+
+@router.post("/quality-impact-evaluate")
+def pipeline_quality_impact_evaluate(request: ImpactEvaluateRequest) -> dict[str, Any]:
+    """链路11-3: 创建影响报告（关联实际规则与样本批次）并执行对照评估。"""
+    from app.services.data_quality_rule import DataQualityRuleService
+    svc = DataQualityRuleService()
+    created = svc.create_impact_report(
+        old_rule_id=request.old_rule_id,
+        new_rule_id=request.new_rule_id,
+        sample_batch=request.sample_batch,
+    )
+    if not created.get("ok"):
+        return created
+    report_id = int(created["report"]["id"])
+    evaluation = svc.run_impact_evaluation(report_id)
+    return {"ok": evaluation.get("ok", False), "report": created["report"],
+            "evaluation": evaluation}
+
+
+@router.get("/quality-impact-view")
+def pipeline_quality_impact_view(report_id: int) -> dict[str, Any]:
+    """链路11-4: 质量影响明细视图（覆盖样本及版本、按来源字段对账）。"""
+    from app.services.data_quality_rule import DataQualityRuleService
+    svc = DataQualityRuleService()
+    return svc.impact_detail_view(report_id)
+
+
+@router.post("/transform-review-import")
+def pipeline_transform_review_import(request: ReviewImportRequest) -> dict[str, Any]:
+    """链路11-5: 数据转换编排跨模块读取对照结果，写入待复核清单。"""
+    from app.services.data_transform import DataTransformService
+    svc = DataTransformService()
+    return svc.import_impact_review_scope(
+        report_id=request.report_id,
+        transform_rule_id=request.transform_rule_id,
+        round_label=request.round_label,
+    )
+
+
+@router.get("/transform-review-list")
+def pipeline_transform_review_list(status: str | None = None) -> dict[str, Any]:
+    """链路11-6: 待复核清单查询。"""
+    from app.services.data_transform import DataTransformService
+    svc = DataTransformService()
+    return svc.list_review_items(status=status)
+
+
+@router.post("/transform-review-action")
+def pipeline_transform_review_action(request: ReviewActionRequest) -> dict[str, Any]:
+    """链路11-7: 待复核条目确认范围 / 排期转换（安排下一轮转换）。"""
+    from app.services.data_transform import DataTransformService
+    svc = DataTransformService()
+    return svc.review_action(item_id=request.item_id, action=request.action)
